@@ -20,6 +20,10 @@ import {
   RefreshCw,
   Info
 } from 'lucide-react';
+import { GoogleGenAI, Type } from '@google/genai';
+
+// --- INITIALIZATION ---
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // --- TYPES ---
 
@@ -80,33 +84,59 @@ const COLORS: Record<BubbleColor, string> = {
 
 const STORAGE_KEY = 'bubbulu_v2';
 const LONG_PRESS_DURATION = 1500;
-const GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent';
 
 // --- UTILS ---
 
 const generateId = () => Math.random().toString(36).substr(2, 9);
 
-const fetchGemini = async (prompt: string, signal: AbortSignal) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) throw new Error('API Key missing');
-
-  const response = await fetch(`${GEMINI_API_URL}?key=${apiKey}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: {
-        responseMimeType: "application/json",
+const fetchGemini = async (prompt: string, signal: AbortSignal, isJson = true, retries = 2) => {
+  let attempt = 0;
+  
+  while (attempt <= retries) {
+    try {
+      const config: any = {};
+      if (isJson) {
+        config.responseMimeType = "application/json";
       }
-    }),
-    signal,
-  });
 
-  if (response.status === 429) throw new Error('Rate limit exceeded (429)');
-  if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+      const response = await ai.models.generateContent({
+        model: 'gemini-2.0-flash', 
+        contents: [{ parts: [{ text: prompt }] }],
+        config
+      });
+      
+      if (!response.text) {
+        throw new Error('Sin respuesta de la IA');
+      }
 
-  const data = await response.json();
-  return JSON.parse(data.candidates[0].content.parts[0].text);
+      const text = response.text.trim();
+      if (isJson) {
+        const jsonStr = text.startsWith('```') ? text.replace(/^```json|```$/g, '').trim() : text;
+        return JSON.parse(jsonStr);
+      }
+      return text;
+    } catch (error: any) {
+      attempt++;
+      const isRateLimit = error.message?.includes('429');
+      
+      if (isRateLimit && attempt <= retries) {
+        // Exponential backoff: 2s, 4s...
+        const delay = Math.pow(2, attempt) * 1000;
+        console.warn(`429 detected, retrying in ${delay}ms... (attempt ${attempt})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+
+      console.error('Gemini error:', error);
+      if (isRateLimit) {
+        throw new Error('Límite de peticiones (429) alcanzado. Por favor, intenta de nuevo en un minuto.');
+      }
+      if (error.name === 'AbortError') {
+        throw new Error('La petición tardó demasiado y fue cancelada.');
+      }
+      throw new Error('Error al conectar con Bubbulú IA: ' + error.message);
+    }
+  }
 };
 
 // --- COMPONENTS ---
@@ -558,8 +588,11 @@ function DetailPanel({ thought, onClose, onUpdate }: {
     }
   };
 
+  const [aiMessage, setAiMessage] = useState<string | null>(null);
+
   const handleReview = async () => {
     setLoading(true);
+    setAiMessage(null);
     setError(null);
     abortController.current = new AbortController();
     
@@ -567,9 +600,8 @@ function DetailPanel({ thought, onClose, onUpdate }: {
     Pensamiento: "${thought.texto}"`;
 
     try {
-      const data = await fetchGemini(prompt, abortController.current.signal);
-      // We'll show this message as an alert or a special field
-      alert(data.respuesta || data); 
+      const data = await fetchGemini(prompt, abortController.current.signal, false);
+      setAiMessage(data); 
     } catch (e: any) {
       setError(e.message);
     } finally {
@@ -616,6 +648,20 @@ function DetailPanel({ thought, onClose, onUpdate }: {
             </div>
             <button onClick={() => setError(null)} className="p-1"><X size={16} /></button>
           </div>
+        )}
+
+        {aiMessage && (
+          <motion.div 
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-blue-500/10 border border-blue-500/30 p-5 rounded-2xl relative overflow-hidden group"
+          >
+            <div className="absolute top-0 left-0 w-1 h-full bg-blue-500/50" />
+            <p className="text-sm italic text-blue-100/80 leading-relaxed pr-6">{aiMessage}</p>
+            <button onClick={() => setAiMessage(null)} className="absolute top-2 right-2 p-1 text-white/20 hover:text-white/50 transition-colors">
+              <X size={14} />
+            </button>
+          </motion.div>
         )}
 
         <section className="space-y-4">
